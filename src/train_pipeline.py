@@ -1,4 +1,3 @@
-%%writefile src/train_pipeline.py
 import duckdb, json, joblib
 import pandas as pd, numpy as np
 from sklearn.model_selection import GroupKFold
