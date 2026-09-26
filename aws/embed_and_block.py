@@ -1,5 +1,6 @@
 import subprocess, sys
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "sentence-transformers", "faiss-cpu"])
+subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                 "sentence-transformers", "faiss-cpu", "duckdb", "pyarrow"])
 
 import argparse, os
 import duckdb

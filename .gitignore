@@ -5,3 +5,4 @@ output/*.tsv
 experiments/*.pkl
 experiments/*.json
 .ipynb_checkpoints/
+.env
