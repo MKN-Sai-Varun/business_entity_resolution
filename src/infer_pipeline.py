@@ -1,58 +1,92 @@
-import duckdb, json, joblib
-import pandas as pd, numpy as np
+import pickle
+import lightgbm as lgb
+from src.db import get_connection
+from src.normalization import build_normalized_test_tables
+from src.blocking import build_candidates, add_rare_gram_channel, coarse_rank_and_cut
+from src.features import build_exact_features, build_fuzzy_features_chunked, assemble_full_features
+from src.decision import apply_decision
+from src.config import TOP_K_PER_SOURCE, OUTPUT_DIR
 
-import config
-from data import load_source
-from normalization import normalize_df
-from blocking import register_table, generate_candidates
-from features import build_features
-from decision import scores_to_pred_dict
+FEATURE_COLS = [
+    "name_exact", "address_exact", "postal_match", "house_match", "country_match",
+    "s1_addr_missing", "other_addr_missing",
+    "name_lev", "name_token_sort", "addr_lev", "addr_token_sort",
+    "cosine_sim",
+]
 
-def write_tsv(d, all_ids, path, col_name):
-    rows = [(eid, ",".join(sorted(d.get(eid, set())))) for eid in all_ids]
-    pd.DataFrame(rows, columns=["source1_entity_id", col_name]).to_csv(path, sep="\t", index=False)
+def run_blocking_test(con):
+    build_candidates(con, "s1_norm_test", "s2_norm_test", "s3_norm_test", "cand_s2_test")
+    build_candidates(con, "s1_norm_test", "s2_norm_test", "s3_norm_test", "cand_s3_test")
+    add_rare_gram_channel(con, "s1_norm_test", "s2_norm_test", "cand_s2_test")
+    add_rare_gram_channel(con, "s1_norm_test", "s3_norm_test", "cand_s3_test")
+    coarse_rank_and_cut(con, "s1_norm_test", "s2_norm_test", "cand_s2_test_raw", "cand_s2_test_topk", TOP_K_PER_SOURCE)
+    coarse_rank_and_cut(con, "s1_norm_test", "s3_norm_test", "cand_s3_test_raw", "cand_s3_test_topk", TOP_K_PER_SOURCE)
+
+def run_features_test(con):
+    build_exact_features(con, "s1_norm_test", "s2_norm_test", "cand_s2_test_topk", "exact_s2_test")
+    build_exact_features(con, "s1_norm_test", "s3_norm_test", "cand_s3_test_topk", "exact_s3_test")
+    build_fuzzy_features_chunked(con, "exact_s2_test", "s2_test")
+    build_fuzzy_features_chunked(con, "exact_s3_test", "s3_test")
+    assemble_full_features(con, "s2_test", "features_s2_test")
+    assemble_full_features(con, "s3_test", "features_s3_test")
+
+def merge_ann_test(con):
+    for tag in ("s2", "s3"):
+        con.execute(f"""
+            CREATE OR REPLACE TABLE features_{tag}_test AS
+            SELECT f.*, coalesce(a.cosine_sim, 0.0) AS cosine_sim
+            FROM features_{tag}_test f
+            LEFT JOIN read_parquet('output/ann_candidates_{tag}_test.parquet') a
+              ON f.s1_id = a.s1_id AND f.other_id = a.other_id
+        """)
+
+def score_and_predict(con, best_config):
+    full = con.execute("SELECT * FROM features_s2_test UNION ALL SELECT * FROM features_s3_test").fetchdf()
+    full[FEATURE_COLS] = full[FEATURE_COLS].fillna(0)
+
+    fold_preds, i = [], 0
+    while (OUTPUT_DIR / f"lgbm_fold{i}.txt").exists():
+        model = lgb.Booster(model_file=str(OUTPUT_DIR / f"lgbm_fold{i}.txt"))
+        fold_preds.append(model.predict(full[FEATURE_COLS]))
+        i += 1
+    full["score"] = sum(fold_preds) / len(fold_preds)
+
+    return apply_decision(full[["s1_id", "other_id", "score"]],
+                           best_config["threshold"], best_config["margin"], best_config["singleton_cap"])
+
+def write_outputs(con, preds):
+    s1_ids = [r[0] for r in con.execute("SELECT entity_id FROM s1_norm_test").fetchall()]
+
+    with open(OUTPUT_DIR / "matching_results.tsv", "w") as f:
+        f.write("source1_entity_id\tmatched_entity_ids\n")
+        for s1_id in s1_ids:
+            f.write(f"{s1_id}\t{','.join(sorted(preds.get(s1_id, set())))}\n")
+
+    cand = con.execute("""
+        SELECT s1_id, other_id FROM cand_s2_test_topk UNION SELECT s1_id, other_id FROM cand_s3_test_topk
+    """).fetchdf()
+    grouped = cand.groupby("s1_id")["other_id"].apply(lambda x: ",".join(sorted(x)))
+    with open(OUTPUT_DIR / "candidate_pairs.tsv", "w") as f:
+        f.write("source1_entity_id\tcandidate_entity_ids\n")
+        for s1_id in s1_ids:
+            f.write(f"{s1_id}\t{grouped.get(s1_id, '')}\n")
 
 def main():
-    con = duckdb.connect(database=":memory:")
-    con.execute(f"SET memory_limit='{config.DUCKDB_MEMORY_LIMIT}'")
-    con.execute(f"SET threads TO {config.DUCKDB_THREADS}")
-
-    s1 = normalize_df(load_source(config.DATA_TEST / "test_source1.tsv"))
-    s2 = normalize_df(load_source(config.DATA_TEST / "test_source2.tsv"))
-    s3 = normalize_df(load_source(config.DATA_TEST / "test_source3.tsv"))
-    all_s1_ids = list(s1["entity_id"])
-
-    register_table(con, "s1", s1); register_table(con, "s2", s2); register_table(con, "s3", s3)
-
-    generate_candidates(con, "s1", "s2", rare_max_df=config.RARE_NGRAM_MAX_DF, out_table="candidates_s2")
-    generate_candidates(con, "s1", "s3", rare_max_df=config.RARE_NGRAM_MAX_DF, out_table="candidates_s3")
-
-    cand_s2 = con.execute("SELECT * FROM candidates_s2").df()
-    cand_s3 = con.execute("SELECT * FROM candidates_s3").df()
-    all_candidates = {}
-    for eid in all_s1_ids:
-        c2 = set(cand_s2.loc[cand_s2.source1_entity_id == eid, "candidate_entity_id"])
-        c3 = set(cand_s3.loc[cand_s3.source1_entity_id == eid, "candidate_entity_id"])
-        all_candidates[eid] = c2 | c3
-    write_tsv(all_candidates, all_s1_ids, config.OUTPUT_DIR / "candidate_pairs.tsv", "candidate_entity_ids")
-
-    models = joblib.load(config.EXPERIMENTS_DIR / "models.pkl")
-    feature_cols = joblib.load(config.EXPERIMENTS_DIR / "feature_cols.pkl")
-    with open(config.EXPERIMENTS_DIR / "decision_config.json") as f:
-        cfg = json.load(f)
-
-    feat_s2 = build_features(con, "candidates_s2", "s1", "s2", is_s2=True)
-    feat_s3 = build_features(con, "candidates_s3", "s1", "s3", is_s2=False)
-    pairs = pd.concat([feat_s2, feat_s3], ignore_index=True)
-    X = pairs[feature_cols]
-
-    scores = np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
-    scored = pairs[["source1_entity_id", "candidate_entity_id"]].copy()
-    scored["score"] = scores
-
-    pred = scores_to_pred_dict(scored, cfg["threshold"], cfg["margin"], cfg["singleton_max_score"])
-    write_tsv(pred, all_s1_ids, config.OUTPUT_DIR / "matching_results.tsv", "matched_entity_ids")
-    print("Wrote candidate_pairs.tsv and matching_results.tsv to", config.OUTPUT_DIR)
+    con = get_connection()
+    print("Stage 1/4: normalize test data")
+    build_normalized_test_tables()
+    print("Stage 2/4: block test data")
+    run_blocking_test(con)
+    print("Stage 3/4: features on test data")
+    run_features_test(con)
+    merge_ann_test(con)
+    print("Stage 4/4: score + decide + write outputs")
+    with open(OUTPUT_DIR / "best_decision_config.pkl", "rb") as f:
+        best_config = pickle.load(f)
+    preds = score_and_predict(con, best_config)
+    write_outputs(con, preds)
+    con.close()
+    print("DONE -> output/matching_results.tsv, output/candidate_pairs.tsv")
 
 if __name__ == "__main__":
     main()

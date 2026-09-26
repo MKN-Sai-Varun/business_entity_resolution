@@ -1,27 +1,29 @@
 import numpy as np
-from itertools import product
-from evaluation import macro_f_beta
+import pandas as pd
+from src.evaluation import macro_f0_5
 
-def scores_to_pred_dict(scored_df, threshold, margin, singleton_max):
-    pred = {}
-    for s1_id, group in scored_df.groupby("source1_entity_id"):
+def apply_decision(scored_df: pd.DataFrame, threshold: float, margin: float, singleton_cap: float):
+    """scored_df: columns [s1_id, other_id, score] — one row per candidate, model score attached.
+    Returns {s1_id: set(other_id)} predictions."""
+    preds = {}
+    for s1_id, group in scored_df.groupby("s1_id"):
         top = group["score"].max()
-        if top < singleton_max:
-            pred[s1_id] = set(); continue
-        keep = group[(group["score"] >= threshold) & (group["score"] >= top - margin)]
-        pred[s1_id] = set(keep["candidate_entity_id"])
-    return pred
+        if top < singleton_cap:
+            preds[s1_id] = set()
+            continue
+        keep = group[group["score"] >= max(threshold, top - margin)]
+        preds[s1_id] = set(keep["other_id"])
+    return preds
 
-def search_thresholds(scored_df, true_dict, all_s1_ids):
-    best = None
-    thresholds = np.arange(0.30, 0.85, 0.05)
-    margins = [0.05, 0.10, 0.15, 0.20, 0.30]
-    singleton_caps = np.arange(0.20, 0.60, 0.05)
-    for t, m, s in product(thresholds, margins, singleton_caps):
-        if s > t: continue
-        pred = scores_to_pred_dict(scored_df, t, m, s)
-        for eid in all_s1_ids: pred.setdefault(eid, set())
-        macro_f05, _ = macro_f_beta(pred, true_dict, beta=0.5)
-        if best is None or macro_f05 > best[0]:
-            best = (macro_f05, t, m, s)
-    return {"macro_f0.5": best[0], "threshold": best[1], "margin": best[2], "singleton_max_score": best[3]}
+def grid_search_decision(scored_df: pd.DataFrame, ground_truth: dict):
+    """Grid search threshold/margin/singleton_cap directly against macro F0.5
+    on out-of-fold predictions — never against a proxy metric."""
+    best = {"macro_f0_5": -1}
+    for singleton_cap in np.arange(0.3, 0.8, 0.05):
+        for threshold in np.arange(0.4, 0.9, 0.05):
+            for margin in np.arange(0.0, 0.3, 0.05):
+                preds = apply_decision(scored_df, threshold, margin, singleton_cap)
+                result = macro_f0_5(ground_truth, preds)
+                if result["macro_f0_5"] > best["macro_f0_5"]:
+                    best = {**result, "threshold": threshold, "margin": margin, "singleton_cap": singleton_cap}
+    return best

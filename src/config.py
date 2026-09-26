@@ -1,24 +1,29 @@
+import os
 from pathlib import Path
 
-DATASET_SLUG = "datasets/mknsaivarun/amazon-ml-challenge-ber-data"
+# Toggle between local dev and SageMaker Processing paths via env var
+RUNTIME = os.environ.get("BER_RUNTIME", "local")  # "local" or "sagemaker"
 
-ROOT = Path("/kaggle/working/business_entity_resolution")
-DATA_TRAIN = Path(f"/kaggle/input/{DATASET_SLUG}/dataset/train")
-DATA_TEST = Path(f"/kaggle/input/{DATASET_SLUG}/dataset/test")
-EXPERIMENTS_DIR = Path("/kaggle/working/experiments")
-OUTPUT_DIR = Path("/kaggle/working/output")
+if RUNTIME == "sagemaker":
+    DATA_DIR = Path("/opt/ml/processing/input")
+    OUTPUT_DIR = Path("/opt/ml/processing/output")
+else:
+    DATA_DIR = Path("dataset")
+    OUTPUT_DIR = Path("output")
+
+TRAIN_DIR = DATA_DIR / "train"
+TEST_DIR = DATA_DIR / "test"
+
+DB_PATH = OUTPUT_DIR / "pipeline.duckdb"
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Blocking / coarse-cut params — TUNE THESE against measured recall, don't assume
+RARE_GRAM_MAX_DOC_FREQ = 0.001   # gram must appear in <0.1% of entities to be used
+TOP_K_PER_SOURCE = 25            # coarse cut candidates kept per S1 entity, per source (S2/S3 separately)
+
+# Fuzzy feature batching
+FUZZY_CHUNK_SIZE = 300_000       # rows per rapidfuzz batch
 
 SEED = 42
-N_CV_FOLDS = 5
-RARE_NGRAM_MAX_DF = 200
-DUCKDB_MEMORY_LIMIT = "24GB"
-DUCKDB_THREADS = 4
-
-LGBM_PARAMS = dict(
-    objective="binary", n_estimators=800, learning_rate=0.03, num_leaves=31,
-    min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
-    reg_alpha=0.1, reg_lambda=0.1, random_state=SEED, n_jobs=-1,
-)
-
-EXPERIMENTS_DIR.mkdir(exist_ok=True, parents=True)
-OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+N_FOLDS = 5

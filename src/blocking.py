@@ -1,79 +1,122 @@
 import duckdb
+from src.db import get_connection
+from src.config import RARE_GRAM_MAX_DOC_FREQ, TOP_K_PER_SOURCE
 
-def register_table(con, name, df):
-    con.register(name, df)
-
-def build_ngram_table(con, src_table, out_table, n=4):
+def build_candidates(con, s1_table, s2_table, s3_table, out_table):
+    """Union of blocking channels -> raw candidate table (recall-first, still large)."""
     con.execute(f"""
-        CREATE OR REPLACE TABLE {out_table} AS
-        SELECT entity_id,
-               unnest(
-                 list_transform(
-                   generate_series(1, greatest(length(name_clean)-{n}+1, 1)),
-                   i -> substr(name_clean, i, {n})
-                 )
-               ) AS ngram
-        FROM {src_table}
-        WHERE length(name_clean) >= {n}
-    """)
-
-def generate_candidates(con, s1_table, other_table, rare_max_df=200, out_table="candidates"):
-    con.execute(f"""
-        CREATE OR REPLACE TABLE cand_exact AS
-        SELECT a.entity_id AS source1_entity_id, b.entity_id AS candidate_entity_id
-        FROM {s1_table} a JOIN {other_table} b
-          ON a.name_no_suffix = b.name_no_suffix AND a.name_no_suffix != ''
-        UNION
-        SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {other_table} b
-          ON a.addr_compact = b.addr_compact AND a.addr_compact != ''
-    """)
-    con.execute(f"""
-        CREATE OR REPLACE TABLE cand_postal AS
-        SELECT a.entity_id AS source1_entity_id, b.entity_id AS candidate_entity_id
-        FROM {s1_table} a JOIN {other_table} b
-          ON a.addr_postal = b.addr_postal AND a.addr_postal != ''
-    """)
-    con.execute(f"""
-        CREATE OR REPLACE TABLE cand_house AS
-        SELECT a.entity_id AS source1_entity_id, b.entity_id AS candidate_entity_id
-        FROM {s1_table} a JOIN {other_table} b
-          ON a.addr_house_no = b.addr_house_no AND a.addr_house_no != ''
-         AND a.name_first_token = b.name_first_token AND a.name_first_token != ''
-    """)
-    build_ngram_table(con, s1_table, "s1_ngrams")
-    build_ngram_table(con, other_table, "other_ngrams")
-    con.execute("""
-        CREATE OR REPLACE TABLE ngram_freq AS
-        SELECT ngram, count(*) AS df FROM other_ngrams GROUP BY ngram
-    """)
-    con.execute(f"""
-        CREATE OR REPLACE TABLE cand_ngram AS
-        SELECT DISTINCT s.entity_id AS source1_entity_id, o.entity_id AS candidate_entity_id
-        FROM s1_ngrams s
-        JOIN ngram_freq f ON s.ngram = f.ngram AND f.df <= {rare_max_df}
-        JOIN other_ngrams o ON s.ngram = o.ngram
-    """)
-    con.execute(f"""
-        CREATE OR REPLACE TABLE {out_table} AS
-        SELECT DISTINCT * FROM cand_exact
-        UNION SELECT DISTINCT * FROM cand_postal
-        UNION SELECT DISTINCT * FROM cand_house
-        UNION SELECT DISTINCT * FROM cand_ngram
-    """)
-    return con.table(out_table)
-
-def candidate_recall_audit(con, candidates_table, gt_pairs_table, source_prefix):
-    return con.execute(f"""
-        WITH true_pairs AS (
-            SELECT * FROM {gt_pairs_table} WHERE matched_entity_id LIKE '{source_prefix}%'
+        CREATE OR REPLACE TABLE {out_table}_raw AS
+        WITH channel_name AS (
+            SELECT a.entity_id AS s1_id, b.entity_id AS other_id
+            FROM {s1_table} a JOIN {s2_table} b ON a.name_norm = b.name_norm AND a.name_norm != ''
+            UNION
+            SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {s3_table} b ON a.name_norm = b.name_norm AND a.name_norm != ''
         ),
-        hits AS (
-            SELECT t.* FROM true_pairs t
-            JOIN {candidates_table} c
-              ON t.source1_entity_id = c.source1_entity_id
-             AND t.matched_entity_id = c.candidate_entity_id
+        channel_addr AS (
+            SELECT a.entity_id AS s1_id, b.entity_id AS other_id
+            FROM {s1_table} a JOIN {s2_table} b ON a.address_norm = b.address_norm AND a.address_norm != ''
+            UNION
+            SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {s3_table} b ON a.address_norm = b.address_norm AND a.address_norm != ''
+        ),
+        channel_postal AS (
+            SELECT a.entity_id AS s1_id, b.entity_id AS other_id
+            FROM {s1_table} a JOIN {s2_table} b ON a.postal_code = b.postal_code AND a.postal_code IS NOT NULL
+            UNION
+            SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {s3_table} b ON a.postal_code = b.postal_code AND a.postal_code IS NOT NULL
+        ),
+        channel_house_name AS (
+            SELECT a.entity_id AS s1_id, b.entity_id AS other_id
+            FROM {s1_table} a JOIN {s2_table} b
+              ON a.house_number = b.house_number AND a.house_number IS NOT NULL
+             AND split_part(a.name_norm, ' ', 1) = split_part(b.name_norm, ' ', 1)
+            UNION
+            SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {s3_table} b
+              ON a.house_number = b.house_number AND a.house_number IS NOT NULL
+             AND split_part(a.name_norm, ' ', 1) = split_part(b.name_norm, ' ', 1)
         )
-        SELECT (SELECT count(*) FROM hits) AS recovered,
-               (SELECT count(*) FROM true_pairs) AS total_true,
-               CAST((SELECT count(*) FROM hits) AS DOUBLE) / NULLIF((SELECT count(*) FROM true_pairs), 0) AS recall
-    """).df()
+        SELECT DISTINCT s1_id, other_id FROM (
+            SELECT * FROM channel_name
+            UNION SELECT * FROM channel_addr
+            UNION SELECT * FROM channel_postal
+            UNION SELECT * FROM channel_house_name
+        )
+    """)
+    raw_count = con.execute(f"SELECT count(*) FROM {out_table}_raw").fetchone()[0]
+    print(f"{out_table}: raw candidates (4 cheap channels) = {raw_count:,}")
+
+def add_rare_gram_channel(con, s1_table, other_table, out_table):
+    """5th channel: shared rare 4-grams, done via a Python UDF registered in DuckDB
+    so the gram explosion happens once and the join stays a normal hash join."""
+    con.execute(f"""
+        CREATE OR REPLACE TABLE grams_s1 AS
+        SELECT entity_id, unnest(
+            [substr(name_norm, i, 4) FOR i IN generate_series(1, greatest(length(name_norm)-3,1))]
+        ) AS gram
+        FROM {s1_table} WHERE length(name_norm) >= 4
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE grams_other AS
+        SELECT entity_id, unnest(
+            [substr(name_norm, i, 4) FOR i IN generate_series(1, greatest(length(name_norm)-3,1))]
+        ) AS gram
+        FROM {other_table} WHERE length(name_norm) >= 4
+    """)
+    total_s1 = con.execute(f"SELECT count(DISTINCT entity_id) FROM {s1_table}").fetchone()[0]
+    con.execute(f"""
+        CREATE OR REPLACE TABLE rare_grams AS
+        SELECT gram FROM (
+            SELECT gram, count(DISTINCT entity_id) AS df FROM grams_s1 GROUP BY gram
+        ) WHERE df::DOUBLE / {total_s1} < {RARE_GRAM_MAX_DOC_FREQ}
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {out_table}_gram AS
+        SELECT DISTINCT g1.entity_id AS s1_id, g2.entity_id AS other_id
+        FROM grams_s1 g1
+        JOIN rare_grams r ON g1.gram = r.gram
+        JOIN grams_other g2 ON g1.gram = g2.gram
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {out_table}_raw AS
+        SELECT s1_id, other_id FROM {out_table}_raw
+        UNION SELECT s1_id, other_id FROM {out_table}_gram
+    """)
+
+def coarse_rank_and_cut(con, s1_table, other_table, raw_table, final_table, k):
+    """Cheap SQL score (token overlap) -> keep top-K per S1 entity. This is what
+    keeps the fuzzy-feature stage from having to touch 100M+ rows."""
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {final_table} AS
+        WITH scored AS (
+            SELECT
+                r.s1_id, r.other_id,
+                len(list_intersect(
+                    string_split(a.name_norm, ' '),
+                    string_split(b.name_norm, ' ')
+                )) AS token_overlap
+            FROM {raw_table} r
+            JOIN {s1_table} a ON r.s1_id = a.entity_id
+            JOIN {other_table} b ON r.other_id = b.entity_id
+        ),
+        ranked AS (
+            SELECT *, row_number() OVER (
+                PARTITION BY s1_id ORDER BY token_overlap DESC
+            ) AS rnk
+            FROM scored
+        )
+        SELECT s1_id, other_id FROM ranked WHERE rnk <= {k}
+    """)
+    n = con.execute(f"SELECT count(*) FROM {final_table}").fetchone()[0]
+    print(f"{final_table}: after top-{k} cut = {n:,} rows")
+
+def run_blocking_train():
+    con = get_connection()
+    build_candidates(con, "s1_norm", "s2_norm", "s3_norm", "cand_s2")
+    build_candidates(con, "s1_norm", "s2_norm", "s3_norm", "cand_s3")  # note: separate S3 channels below
+    add_rare_gram_channel(con, "s1_norm", "s2_norm", "cand_s2")
+    add_rare_gram_channel(con, "s1_norm", "s3_norm", "cand_s3")
+    coarse_rank_and_cut(con, "s1_norm", "s2_norm", "cand_s2_raw", "cand_s2_topk", TOP_K_PER_SOURCE)
+    coarse_rank_and_cut(con, "s1_norm", "s3_norm", "cand_s3_raw", "cand_s3_topk", TOP_K_PER_SOURCE)
+    con.close()
+
+if __name__ == "__main__":
+    run_blocking_train()
