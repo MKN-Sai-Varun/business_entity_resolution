@@ -2,35 +2,25 @@ import duckdb
 from src.db import get_connection
 from src.config import RARE_GRAM_MAX_DOC_FREQ, TOP_K_PER_SOURCE
 
-def build_candidates(con, s1_table, s2_table, s3_table, out_table):
-    """Union of blocking channels -> raw candidate table (recall-first, still large)."""
+def build_candidates(con, s1_table, other_table, out_table):
+    """Union of blocking channels against ONE target source table (S2 or S3)."""
     con.execute(f"""
         CREATE OR REPLACE TABLE {out_table}_raw AS
         WITH channel_name AS (
             SELECT a.entity_id AS s1_id, b.entity_id AS other_id
-            FROM {s1_table} a JOIN {s2_table} b ON a.name_norm = b.name_norm AND a.name_norm != ''
-            UNION
-            SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {s3_table} b ON a.name_norm = b.name_norm AND a.name_norm != ''
+            FROM {s1_table} a JOIN {other_table} b ON a.name_norm = b.name_norm AND a.name_norm != ''
         ),
         channel_addr AS (
             SELECT a.entity_id AS s1_id, b.entity_id AS other_id
-            FROM {s1_table} a JOIN {s2_table} b ON a.address_norm = b.address_norm AND a.address_norm != ''
-            UNION
-            SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {s3_table} b ON a.address_norm = b.address_norm AND a.address_norm != ''
+            FROM {s1_table} a JOIN {other_table} b ON a.address_norm = b.address_norm AND a.address_norm != ''
         ),
         channel_postal AS (
             SELECT a.entity_id AS s1_id, b.entity_id AS other_id
-            FROM {s1_table} a JOIN {s2_table} b ON a.postal_code = b.postal_code AND a.postal_code IS NOT NULL
-            UNION
-            SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {s3_table} b ON a.postal_code = b.postal_code AND a.postal_code IS NOT NULL
+            FROM {s1_table} a JOIN {other_table} b ON a.postal_code = b.postal_code AND a.postal_code IS NOT NULL
         ),
         channel_house_name AS (
             SELECT a.entity_id AS s1_id, b.entity_id AS other_id
-            FROM {s1_table} a JOIN {s2_table} b
-              ON a.house_number = b.house_number AND a.house_number IS NOT NULL
-             AND split_part(a.name_norm, ' ', 1) = split_part(b.name_norm, ' ', 1)
-            UNION
-            SELECT a.entity_id, b.entity_id FROM {s1_table} a JOIN {s3_table} b
+            FROM {s1_table} a JOIN {other_table} b
               ON a.house_number = b.house_number AND a.house_number IS NOT NULL
              AND split_part(a.name_norm, ' ', 1) = split_part(b.name_norm, ' ', 1)
         )
@@ -42,7 +32,7 @@ def build_candidates(con, s1_table, s2_table, s3_table, out_table):
         )
     """)
     raw_count = con.execute(f"SELECT count(*) FROM {out_table}_raw").fetchone()[0]
-    print(f"{out_table}: raw candidates (4 cheap channels) = {raw_count:,}")
+    print(f"{out_table}: raw candidates (4 cheap channels, vs {other_table}) = {raw_count:,}")
 
 def add_rare_gram_channel(con, s1_table, other_table, out_table):
     """5th channel: shared rare 4-grams, done via a Python UDF registered in DuckDB
@@ -110,8 +100,8 @@ def coarse_rank_and_cut(con, s1_table, other_table, raw_table, final_table, k):
 
 def run_blocking_train():
     con = get_connection()
-    build_candidates(con, "s1_norm", "s2_norm", "s3_norm", "cand_s2")
-    build_candidates(con, "s1_norm", "s2_norm", "s3_norm", "cand_s3")  # note: separate S3 channels below
+    build_candidates(con, "s1_norm", "s2_norm", "cand_s2")
+    build_candidates(con, "s1_norm", "s3_norm", "cand_s3")
     add_rare_gram_channel(con, "s1_norm", "s2_norm", "cand_s2")
     add_rare_gram_channel(con, "s1_norm", "s3_norm", "cand_s3")
     coarse_rank_and_cut(con, "s1_norm", "s2_norm", "cand_s2_raw", "cand_s2_topk", TOP_K_PER_SOURCE)

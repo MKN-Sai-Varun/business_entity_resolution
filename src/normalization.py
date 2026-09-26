@@ -19,7 +19,7 @@ SELECT
             regexp_replace(lower(business_name), '&', ' and ', 'g'),
             '[^a-z0-9 ]', ' ', 'g'
         )),
-        '\\y(inc|incorporated|ltd|limited|llc|corp|corporation|pvt|private|co)\\y', '', 'g'
+        '\\b(inc|incorporated|ltd|limited|llc|corp|corporation|pvt|private|co)\\b', '', 'g'
     )) AS name_core,
     trim(regexp_replace(lower(business_address), '[^a-z0-9 ]', ' ', 'g')) AS address_norm,
     -- extracted house number (leading digits)

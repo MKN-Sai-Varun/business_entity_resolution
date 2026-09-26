@@ -5,9 +5,10 @@ pip install -r requirements.txt
 Place train files under dataset/train/, test files under dataset/test/
 (or point config.py DATA_TRAIN/DATA_TEST at the Kaggle dataset mount).
 
-## Run
-cd src
-python3 train_pipeline.py
-python3 infer_pipeline.py
-cd ..
-python3 utils/own_validate.py output/matching_results.tsv output/candidate_pairs.tsv dataset/test
+## Run (from the repo root, not from src/)
+python3 -m src.train_pipeline
+python3 -m src.infer_pipeline
+python3 utils/validate_submission.py \
+    --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv \
+    --test-dir dataset/test

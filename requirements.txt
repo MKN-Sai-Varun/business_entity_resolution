@@ -6,3 +6,4 @@ rapidfuzz==3.9.6
 duckdb==1.0.0
 scipy==1.13.1
 joblib==1.4.2
+pyarrow==17.0.0

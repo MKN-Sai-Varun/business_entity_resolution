@@ -15,8 +15,8 @@ FEATURE_COLS = [
 ]
 
 def run_blocking_test(con):
-    build_candidates(con, "s1_norm_test", "s2_norm_test", "s3_norm_test", "cand_s2_test")
-    build_candidates(con, "s1_norm_test", "s2_norm_test", "s3_norm_test", "cand_s3_test")
+    build_candidates(con, "s1_norm_test", "s2_norm_test", "cand_s2_test")
+    build_candidates(con, "s1_norm_test", "s3_norm_test", "cand_s3_test")
     add_rare_gram_channel(con, "s1_norm_test", "s2_norm_test", "cand_s2_test")
     add_rare_gram_channel(con, "s1_norm_test", "s3_norm_test", "cand_s3_test")
     coarse_rank_and_cut(con, "s1_norm_test", "s2_norm_test", "cand_s2_test_raw", "cand_s2_test_topk", TOP_K_PER_SOURCE)
