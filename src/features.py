@@ -7,14 +7,20 @@ from src.config import CHECKPOINT_DIR, FUZZY_CHUNK_SIZE
 
 def build_exact_features(con, s1_table, other_table, cand_table, out_table):
     """Pure SQL — no Python loop, no memory risk."""
-    # in build_exact_features, add a stable row number to the SELECT list:
     con.execute(f"""
         CREATE OR REPLACE TABLE {out_table} AS
         SELECT
             row_number() OVER () AS rn,
             c.s1_id, c.other_id,
             (a.name_norm = b.name_norm) AS name_exact,
-            -- ... rest unchanged
+            (a.address_norm = b.address_norm) AS address_exact,
+            (a.postal_code = b.postal_code AND a.postal_code IS NOT NULL) AS postal_match,
+            (a.house_number = b.house_number AND a.house_number IS NOT NULL) AS house_match,
+            (a.country = b.country) AS country_match,
+            (a.address_norm IS NULL OR a.address_norm = '') AS s1_addr_missing,
+            (b.address_norm IS NULL OR b.address_norm = '') AS other_addr_missing,
+            a.name_norm AS s1_name, b.name_norm AS other_name,
+            a.address_norm AS s1_addr, b.address_norm AS other_addr
         FROM {cand_table} c
         JOIN {s1_table} a ON c.s1_id = a.entity_id
         JOIN {other_table} b ON c.other_id = b.entity_id

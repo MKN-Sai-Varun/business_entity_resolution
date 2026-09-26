@@ -9,7 +9,7 @@ from src.features import run_feature_pipeline
 from src.evaluation import macro_f0_5
 from src.decision import grid_search_decision
 from src.config import N_FOLDS, SEED, OUTPUT_DIR
-
+ 
 FEATURE_COLS = [
     "name_exact", "address_exact", "postal_match", "house_match", "country_match",
     "s1_addr_missing", "other_addr_missing",
@@ -32,13 +32,15 @@ def build_ground_truth_table(con):
         WHERE matched_entity_ids != ''
     """)
 
+
+
 def merge_ann_candidates(con):
     for tag in ("s2", "s3"):
         con.execute(f"""
             CREATE OR REPLACE TABLE features_{tag} AS
             SELECT f.*, coalesce(a.cosine_sim, 0.0) AS cosine_sim
             FROM features_{tag} f
-            LEFT JOIN read_parquet('output/ann_candidates_{tag}_train.parquet') a
+            LEFT JOIN read_parquet('{OUTPUT_DIR}/ann_candidates_{tag}_train.parquet') a
               ON f.s1_id = a.s1_id AND f.other_id = a.other_id
         """)
 
