@@ -33,9 +33,9 @@ def run_features_test(con):
 def merge_ann_test(con):
     for tag in ("s2", "s3"):
         con.execute(f"""
-            CREATE OR REPLACE TABLE features_{tag} AS
+            CREATE OR REPLACE TABLE features_{tag}_test AS
             SELECT f.*, coalesce(a.cosine_sim, 0.0) AS cosine_sim
-            FROM features_{tag} f
+            FROM features_{tag}_test f
             LEFT JOIN read_parquet('{OUTPUT_DIR}/ann_candidates_{tag}_test.parquet') a
               ON f.s1_id = a.s1_id AND f.other_id = a.other_id
         """)
