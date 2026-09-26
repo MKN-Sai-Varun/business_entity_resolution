@@ -27,22 +27,37 @@ def encode_table(model, con, table, batch_size=512):
 def build_ann_candidates(s1_meta, s1_emb, other_meta, other_emb, k=15):
     """Partitioned by whatever countries are actually present -- never hardcoded
     to {US, India}, so France is handled automatically."""
-    results = []
+    s1_ids_arr = s1_meta["entity_id"].to_numpy()
+    other_ids_arr = other_meta["entity_id"].to_numpy()
+
+    chunks = []
     countries = set(s1_meta["country"]) & set(other_meta["country"])
     for country in countries:
         s1_idx = s1_meta.index[s1_meta["country"] == country].to_numpy()
         other_idx = other_meta.index[other_meta["country"] == country].to_numpy()
         if len(s1_idx) == 0 or len(other_idx) == 0:
             continue
+
         index = faiss.IndexFlatIP(other_emb.shape[1])
         index.add(other_emb[other_idx])
         sims, nn = index.search(s1_emb[s1_idx], min(k, len(other_idx)))
-        for i, s1_row in enumerate(s1_idx):
-            s1_id = s1_meta.iloc[s1_row]["entity_id"]
-            for j in range(nn.shape[1]):
-                other_row = other_idx[nn[i, j]]
-                results.append((s1_id, other_meta.iloc[other_row]["entity_id"], float(sims[i, j])))
-    return pd.DataFrame(results, columns=["s1_id", "other_id", "cosine_sim"])
+
+        # nn/sims are shape (len(s1_idx), k_actual); flatten row-major (default 'C'
+        # order for both np.repeat and .flatten()) so the three arrays stay aligned
+        # element-for-element without any Python-level loop.
+        s1_ids_flat = np.repeat(s1_ids_arr[s1_idx], nn.shape[1])
+        other_ids_flat = other_ids_arr[other_idx][nn.flatten()]
+        sims_flat = sims.flatten()
+
+        chunks.append(pd.DataFrame({
+            "s1_id": s1_ids_flat,
+            "other_id": other_ids_flat,
+            "cosine_sim": sims_flat,
+        }))
+
+    if not chunks:
+        return pd.DataFrame(columns=["s1_id", "other_id", "cosine_sim"])
+    return pd.concat(chunks, ignore_index=True)
 
 def main(db_path, out_dir, split):
     con = duckdb.connect(db_path)
