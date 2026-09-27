@@ -27,3 +27,7 @@ FUZZY_CHUNK_SIZE = 300_000       # rows per rapidfuzz batch
 
 SEED = 42
 N_FOLDS = 5
+# Dev/testing: cap every source table to this many rows for a quick smoke-test
+# of the pipeline. 0 = full dataset (real run). Set via env var so you don't
+# have to edit code to switch between dev and full runs.
+SAMPLE_ROWS = int(os.environ.get("BER_SAMPLE_ROWS", "0"))
